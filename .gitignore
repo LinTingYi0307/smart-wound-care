@@ -32,6 +32,7 @@ uploads/wounds/*
 # YOLO model and secret keys
 yolo11m.pt
 yolo11m_best.pt
+*.pt
 secret.key
 backend_export/
 backend_export.zip

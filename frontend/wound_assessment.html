@@ -61,8 +61,8 @@
                     
                     <div id="imagePreviewContainer" class="hidden mt-4">
                         <img id="imagePreview" src="#" alt="傷口預覽" class="w-full h-auto rounded-lg shadow-sm border border-gray-200">
-                        <button onclick="analyzeImage()" class="mt-4 w-full bg-medical-500 text-white py-2 rounded-lg font-medium hover:bg-medical-600 transition shadow-sm">
-                            啟動 YOLOv8 AI 辨識
+                        <button onclick="analyzeImage(this)" class="mt-4 w-full bg-medical-500 text-white py-2 rounded-lg font-medium hover:bg-medical-600 transition shadow-sm">
+                            啟動 WoundCare+ 影像分析
                         </button>
                     </div>
                 </div>
@@ -71,20 +71,20 @@
                     <div class="absolute top-0 left-0 w-1 h-full bg-blue-500"></div>
                     <h3 class="text-lg font-bold text-gray-900 mb-4 flex items-center">
                         <svg class="w-5 h-5 text-blue-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path></svg>
-                        AI 客觀判定結果
+                        AI 研究分析提示（須人工覆核）
                     </h3>
                     <div class="grid grid-cols-2 gap-4 mb-4">
                         <div class="bg-white p-3 rounded shadow-sm">
-                            <p class="text-xs text-gray-500 uppercase font-semibold">傷口分級</p>
-                            <p id="aiGrade" class="text-xl font-bold text-blue-700 mt-1">Grade X</p>
+                            <p class="text-xs text-gray-500 uppercase font-semibold">臨床分級</p>
+                            <p id="aiGrade" class="text-xl font-bold text-blue-700 mt-1">待人工判讀</p>
                         </div>
                         <div class="bg-white p-3 rounded shadow-sm">
-                            <p class="text-xs text-gray-500 uppercase font-semibold">信心指數 (Confidence)</p>
+                            <p class="text-xs text-gray-500 uppercase font-semibold">研究分類信心（非診斷機率）</p>
                             <p id="aiConfidence" class="text-xl font-bold text-green-600 mt-1">--%</p>
                         </div>
                     </div>
                     <div class="bg-white p-4 rounded shadow-sm">
-                        <p class="text-xs text-gray-500 uppercase font-semibold mb-1">標準照護建議</p>
+                        <p class="text-xs text-gray-500 uppercase font-semibold mb-1">模型提示與限制</p>
                         <p id="aiAdvice" class="text-sm text-gray-700 leading-relaxed"></p>
                     </div>
                 </div>
@@ -188,15 +188,14 @@
 
         let lastAnnotatedImageUrl = null;
 
-        // --- 3. 呼叫 YOLOv8 AI 模型 API ---
-        async function analyzeImage() {
+        // --- 3. 呼叫 WoundCare+ 影像分析 API ---
+        async function analyzeImage(btn) {
             const fileInput = document.getElementById('fileInput');
             if (!fileInput.files || fileInput.files.length === 0) {
                 alert("請先選擇或拖放一張傷口圖片，再進行 AI 辨識！");
                 return;
             }
 
-            const btn = event.currentTarget || event.target;
             const originalText = btn.textContent;
             btn.textContent = "AI 分析中，請稍候...";
             btn.disabled = true;

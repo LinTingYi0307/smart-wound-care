@@ -419,12 +419,12 @@
                 woundHtml += `<div class="col-span-full py-8 text-center text-gray-400 italic border border-dashed border-gray-200 rounded-xl bg-gray-50">該病患目前無臨床傷口影像評估紀錄</div>`;
             } else {
                 data.wound_history.forEach(w => {
-                    const hasDisc = w.ai_grade !== w.nurse_grade;
+                    const hasDisc = w.ai_grade !== '待人工判讀' && w.ai_grade !== w.nurse_grade;
                     const borderClass = hasDisc ? 'border-red-200 bg-red-50 bg-opacity-30' : 'border-gray-200 hover:border-medical-500';
                     const badgeClass = hasDisc 
                         ? 'bg-red-100 text-red-800 border border-red-200' 
                         : 'bg-green-100 text-green-800';
-                    const statusText = hasDisc ? '判定有落差' : '評估一致';
+                    const statusText = w.ai_grade === '待人工判讀' ? '僅供人工覆核' : (hasDisc ? '判定有落差' : '評估一致');
                     
                     woundHtml += `
                         <div onclick="openWoundDetail(${w.id})" class="border rounded-xl p-4 flex gap-4 cursor-pointer hover:shadow transition ${borderClass}">

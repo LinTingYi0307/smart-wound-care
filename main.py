@@ -343,7 +343,7 @@ def health_check():
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return {"status": "healthy", "database": "connected"}
+        return {"status": "healthy", "database": "connected", "inference_ready": cls_model is not None and seg_model is not None}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database offline: {str(e)}")
 
@@ -496,197 +496,53 @@ import os
 import time
 import cv2
 import numpy as np
-import base64
-import onnxruntime as ort
 
-class YOLOONNX:
-    def __init__(self, model_path="yolo11m.onnx"):
-        # 強制開啟 ONNX 記憶體與執行緒優化以防 Render 512MB OOM 崩潰
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        opts.enable_mem_pattern = False
-        opts.enable_cpu_mem_arena = False
-        
-        self.session = ort.InferenceSession(model_path, sess_options=opts, providers=["CPUExecutionProvider"])
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [o.name for o in self.session.get_outputs()]
-        self.names = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus',
-            6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant',
-            11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat',
-            16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear',
-            22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag',
-            27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard',
-            32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove',
-            36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle',
-            40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl',
-            46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli',
-            51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake',
-            56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table',
-            61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote',
-            66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster',
-            71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase',
-            76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'
-        }
+from ultralytics import YOLO
+from woundcare_inference import CascadeConfig
+from woundcare_integration import analyze_image
 
-    def __call__(self, img, conf_threshold=0.25, iou_threshold=0.45):
-        h, w = img.shape[:2]
-        input_size = 640
-        
-        r = min(input_size / h, input_size / w)
-        new_unpad_w, new_unpad_h = int(round(w * r)), int(round(h * r))
-        pad_w = (input_size - new_unpad_w) / 2
-        pad_h = (input_size - new_unpad_h) / 2
-        
-        resized = cv2.resize(img, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
-        top, bottom = int(round(pad_h - 0.1)), int(round(pad_h + 0.1))
-        left, right = int(round(pad_w - 0.1)), int(round(pad_w + 0.1))
-        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        
-        blob = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        blob = blob.transpose((2, 0, 1))  # HWC -> CHW
-        blob = np.expand_dims(blob, axis=0)  # CHW -> BCHW
-        blob = blob.astype(np.float32) / 255.0
-        
-        outputs = self.session.run(self.output_names, {self.input_name: blob})
-        output = outputs[0][0].T  # (8400, 84)
-        
-        boxes = []
-        confidences = []
-        class_ids = []
-        
-        for row in output:
-            classes_scores = row[4:]
-            class_id = np.argmax(classes_scores)
-            score = classes_scores[class_id]
-            if score > conf_threshold:
-                cx, cy, box_w, box_h = row[:4]
-                x1 = cx - box_w / 2
-                y1 = cy - box_h / 2
-                x1 = (x1 - pad_w) / r
-                y1 = (y1 - pad_h) / r
-                box_w_scaled = box_w / r
-                box_h_scaled = box_h / r
-                
-                boxes.append([int(x1), int(y1), int(box_w_scaled), int(box_h_scaled)])
-                confidences.append(float(score))
-                class_ids.append(int(class_id))
-                
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, iou_threshold)
-        
-        class BoxObj:
-            def __init__(self, xyxy, cls, conf):
-                self.xyxy = [xyxy]
-                self.cls = [cls]
-                self.conf = [conf]
-                
-        class ResultObj:
-            def __init__(self, boxes_list, names):
-                self.boxes = boxes_list
-                self.names = names
-                
-            def plot(self):
-                annotated = img.copy()
-                for box in self.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    label = f"{self.names[cls_id]} {conf:.2f}"
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                    cv2.putText(annotated, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                return annotated
-                
-        final_boxes = []
-        if len(indices) > 0:
-            for idx in indices.flatten():
-                x, y, box_w, box_h = boxes[idx]
-                cls_id = class_ids[idx]
-                conf = confidences[idx]
-                x1 = max(0, x)
-                y1 = max(0, y)
-                x2 = min(w, x + box_w)
-                y2 = min(h, y + box_h)
-                final_boxes.append(BoxObj([x1, y1, x2, y2], cls_id, conf))
-                
-        res_obj = ResultObj(final_boxes, self.names)
-        return [res_obj]
-
-# 建立上傳檔案的資料夾 (如果不存在的話)
 UPLOAD_DIR = "uploads/wounds"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 載入 YOLOv8 傷口特徵辨識模型 (ONNX 格式，省去大容量 PyTorch 的記憶體與載入時間)
-MODEL_PATH = "yolo11m.onnx"
-try:
-    yolo_model = YOLOONNX(MODEL_PATH)
-    print("[YOLO] ONNX Model loaded successfully!")
-except Exception as e:
-    yolo_model = None
-    print(f"[YOLO] ONNX Model load failed: {str(e)}")
+CLS_MODEL_PATH = os.environ.get("WOUNDCARE_CLS_MODEL")
+SEG_MODEL_PATH = os.environ.get("WOUNDCARE_SEG_MODEL")
+
+def load_wound_model(path):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return YOLO(path)
+    except Exception:
+        return None
+
+cls_model = load_wound_model(CLS_MODEL_PATH)
+seg_model = load_wound_model(SEG_MODEL_PATH)
+CASCADE_CONFIG = CascadeConfig(segmenter_confidence=0.10, segmenter_imgsz=384,
+                               classifier_imgsz=224, classification_source="full_image")
 
 @app.post("/api/predict")
-async def predict_wound(
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    接收傷口影像，執行 YOLOv8 辨識，並將標註後影像存檔後回傳
-    """
-    if yolo_model is None:
-        raise HTTPException(status_code=500, detail="後端 YOLO 模型尚未載入完成或載入失敗。")
-        
+async def predict_wound(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "nurse":
+        raise HTTPException(status_code=403, detail="僅限護理師使用影像分析")
+    if cls_model is None or seg_model is None:
+        raise HTTPException(status_code=503, detail="WoundCare+ 模型未就緒，請設定分類與分割模型路徑")
+    if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=415, detail="僅接受 JPG、PNG 或 WebP 圖片")
+    contents = await file.read(10 * 1024 * 1024 + 1)
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="圖片大小不可超過 10 MB")
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    if img is None or img.size == 0:
+        raise HTTPException(status_code=400, detail="圖片無法解析")
     try:
-        # 1. 讀取圖片檔案
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise HTTPException(status_code=400, detail="無效的圖片檔案")
-            
-        # 2. 進行 YOLOv8 辨識
-        results = yolo_model(img)
-        result = results[0]
-        num_boxes = len(result.boxes)
-        
-        # 3. 繪製標註框並儲存為獨立的標註圖片
-        annotated_img = result.plot()
-        unique_id = f"{int(time.time())}_{os.urandom(4).hex()}"
-        annotated_filename = f"annotated_{unique_id}.jpg"
-        annotated_path = os.path.join(UPLOAD_DIR, annotated_filename)
-        cv2.imwrite(annotated_path, annotated_img)
-        
-        annotated_image_url = f"/{UPLOAD_DIR}/{annotated_filename}"
-        
-        # 4. 根據偵測結果及分級標準生成 AI 分級建議 (模擬與 backend_export 同等的專業 TIME 指導)
-        if num_boxes > 0:
-            # 依據標註框數量判定分級
-            ai_grade = "Grade 2" if num_boxes == 1 else "Grade 3"
-            ai_confidence = float(result.boxes.conf[0]) if hasattr(result.boxes, 'conf') and len(result.boxes.conf) > 0 else 0.85
-            ai_advice = (
-                f"[AI 臨床診斷] YOLO 成功偵測到 {num_boxes} 個傷口特徵區域！\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 偵測到黃色腐肉與疑似壞死組織，建議進行局部清創。\n"
-                f"I (Infection 感染): 傷口周邊伴隨紅腫泛紅反應，可能存在中度感染風險。\n"
-                f"M (Moisture 滲出液): 評估滲出液量偏多，建議選用高吸收性敷料。\n"
-                f"E (Edge 邊緣): 傷口邊界有浸潤現象，需塗抹皮膚保護劑防止浸漬。"
-            )
-        else:
-            ai_grade = "Grade 1"
-            ai_confidence = 0.50
-            ai_advice = "[AI 臨床診斷] 未偵測到明顯的傷口邊界特徵。請確保拍攝光線充足、角度垂直並重新嘗試。"
-
-        return {
-            "status": "success",
-            "ai_grade": ai_grade,
-            "ai_confidence": ai_confidence,
-            "ai_advice": ai_advice,
-            "annotated_image_url": annotated_image_url
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI 辨識發生錯誤: {str(e)}")
+        result = analyze_image(img, cls_model, seg_model, CASCADE_CONFIG)
+        filename = f"annotated_{int(time.time())}_{os.urandom(4).hex()}.jpg"
+        path = os.path.join(UPLOAD_DIR, filename)
+        if not cv2.imwrite(path, result.pop("annotated")):
+            raise RuntimeError("annotated image write failed")
+        return {"status": "success", **result, "annotated_image_url": f"/{UPLOAD_DIR}/{filename}"}
+    except Exception:
+        raise HTTPException(status_code=500, detail="影像分析失敗，請確認圖片後重試")
 
 @app.post("/api/records")
 async def create_wound_record(
@@ -832,7 +688,7 @@ def get_audit_logs(current_user: dict = Depends(get_current_user)):
             for log in logs:
                 log["created_at"] = log["created_at"].strftime("%Y-%m-%d %H:%M")
                 # 簡單的比對邏輯：如果兩者字串不同，就標記為有差異 (has_discrepancy)
-                log["has_discrepancy"] = log["ai_grade"] != log["nurse_grade"]
+                log["has_discrepancy"] = log["ai_grade"] != "待人工判讀" and log["ai_grade"] != log["nurse_grade"]
                 
             return {
                 "status": "success",
@@ -1377,8 +1233,6 @@ def chat_with_local_ai(req: ChatReq, current_user: dict = Depends(get_current_us
                         created_str = r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "未知時間"
                         records_list.append(
                             f"第 {i+1} 筆紀錄時間：{created_str}\n"
-                            f"  - AI 判定等級：{r.ai_grade}\n"
-                            f"  - AI 照護建議：{r.ai_advice}\n"
                             f"  - 護理師判定等級：{r.nurse_grade}\n"
                             f"  - 護理師交代建議：{r.nurse_advice} (由護理師 {r.nurse_name} 提供)"
                         )
@@ -1410,7 +1264,7 @@ def chat_with_local_ai(req: ChatReq, current_user: dict = Depends(get_current_us
             "=== 病患最新歷次傷口紀錄與建議 ===\n"
             f"{wound_records_str}\n\n"
             "=== 回答規範 ===\n"
-            "1. 請優先結合上述病患的『護理師交代建議』與『AI 照護建議』來作答。例如：如果護理師曾交代要使用生理食鹽水清洗或定時換藥，應在對話中溫柔地提醒與追蹤病患是否遵循。\n"
+            "1. 請依護理師交代的建議回答；研究模型的分類提示不能作為診斷或處置依據。\n"
             "2. 回答時請簡明扼要、條理清晰，多用列點說明。\n"
             "3. 請以溫柔、鼓勵、同理心關懷的語氣與病患對話。\n"
             "4. 重要：如果病患描述的症狀嚴重（如：發高燒、傷口劇烈疼痛、大量滲血、發出惡臭），請務必強烈提醒他們應立即尋求專業醫師或回院急診就醫。"
