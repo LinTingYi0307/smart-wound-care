@@ -499,8 +499,8 @@ import numpy as np
 import base64
 import onnxruntime as ort
 
-class YOLOONNX:
-    def __init__(self, model_path="yolo11m.onnx"):
+class DualWoundONNX:
+    def __init__(self, seg_model_path="segmenter.onnx", cls_model_path="classifier.onnx"):
         # 強制開啟 ONNX 記憶體與執行緒優化以防 Render 512MB OOM 崩潰
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 1
@@ -509,122 +509,106 @@ class YOLOONNX:
         opts.enable_mem_pattern = False
         opts.enable_cpu_mem_arena = False
         
-        self.session = ort.InferenceSession(model_path, sess_options=opts, providers=["CPUExecutionProvider"])
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [o.name for o in self.session.get_outputs()]
-        self.names = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus',
-            6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant',
-            11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat',
-            16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear',
-            22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag',
-            27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard',
-            32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove',
-            36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle',
-            40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl',
-            46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli',
-            51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake',
-            56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table',
-            61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote',
-            66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster',
-            71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase',
-            76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'
+        self.seg_session = ort.InferenceSession(seg_model_path, sess_options=opts, providers=["CPUExecutionProvider"])
+        self.cls_session = ort.InferenceSession(cls_model_path, sess_options=opts, providers=["CPUExecutionProvider"])
+        
+        self.cls_names_zh = {
+            0: '擦傷 (Abrasions)',
+            1: '瘀傷/挫傷 (Bruises)',
+            2: '燒燙傷 (Burns)',
+            3: '切割傷 (Cut)',
+            4: '甲溝炎/嵌甲 (Ingrown Nails)',
+            5: '撕裂傷 (Laceration)',
+            6: '刺傷 (Stab Wound)'
+        }
+        self.cls_names_en = {
+            0: 'Abrasions',
+            1: 'Bruises',
+            2: 'Burns',
+            3: 'Cut',
+            4: 'Ingrown_nails',
+            5: 'Laceration',
+            6: 'Stab_wound'
         }
 
-    def __call__(self, img, conf_threshold=0.25, iou_threshold=0.45):
+    def predict(self, img, conf_threshold=0.25, iou_threshold=0.45):
         h, w = img.shape[:2]
-        input_size = 640
-        
+
+        # 1. 傷口類別特徵分類 (Classifier: 224x224)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        cls_input = cv2.resize(img_rgb, (224, 224)).transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        cls_out = self.cls_session.run(None, {'images': cls_input})[0][0]
+        probs = np.exp(cls_out - np.max(cls_out)) / np.sum(np.exp(cls_out - np.max(cls_out)))
+        top1_idx = int(np.argmax(probs))
+        top_cls_zh = self.cls_names_zh.get(top1_idx, '未知傷口')
+        top_cls_en = self.cls_names_en.get(top1_idx, 'Unknown')
+        top_cls_conf = float(probs[top1_idx])
+
+        # 2. 傷口 ROI 邊界分割與框選 (Segmenter: 384x384)
+        input_size = 384
         r = min(input_size / h, input_size / w)
-        new_unpad_w, new_unpad_h = int(round(w * r)), int(round(h * r))
-        pad_w = (input_size - new_unpad_w) / 2
-        pad_h = (input_size - new_unpad_h) / 2
-        
-        resized = cv2.resize(img, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
-        top, bottom = int(round(pad_h - 0.1)), int(round(pad_h + 0.1))
-        left, right = int(round(pad_w - 0.1)), int(round(pad_w + 0.1))
+        nw, nh = int(round(w * r)), int(round(h * r))
+        pw, ph = (input_size - nw) / 2, (input_size - nh) / 2
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(ph - 0.1)), int(round(ph + 0.1))
+        left, right = int(round(pw - 0.1)), int(round(pw + 0.1))
         padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        
-        blob = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        blob = blob.transpose((2, 0, 1))  # HWC -> CHW
-        blob = np.expand_dims(blob, axis=0)  # CHW -> BCHW
-        blob = blob.astype(np.float32) / 255.0
-        
-        outputs = self.session.run(self.output_names, {self.input_name: blob})
-        output = outputs[0][0].T  # (8400, 84)
-        
-        boxes = []
-        confidences = []
-        class_ids = []
-        
-        for row in output:
-            classes_scores = row[4:]
-            class_id = np.argmax(classes_scores)
-            score = classes_scores[class_id]
+
+        blob = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        preds, protos = self.seg_session.run(None, {'images': blob})
+        pred = preds[0].T
+
+        boxes, confidences = [], []
+        for row in pred:
+            score = float(row[4])
             if score > conf_threshold:
-                cx, cy, box_w, box_h = row[:4]
-                x1 = cx - box_w / 2
-                y1 = cy - box_h / 2
-                x1 = (x1 - pad_w) / r
-                y1 = (y1 - pad_h) / r
-                box_w_scaled = box_w / r
-                box_h_scaled = box_h / r
-                
-                boxes.append([int(x1), int(y1), int(box_w_scaled), int(box_h_scaled)])
-                confidences.append(float(score))
-                class_ids.append(int(class_id))
-                
+                cx, cy, bw, bh = row[:4]
+                x1 = (cx - bw / 2 - pw) / r
+                y1 = (cy - bh / 2 - ph) / r
+                boxes.append([int(x1), int(y1), int(bw / r), int(bh / r)])
+                confidences.append(score)
+
         indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, iou_threshold)
-        
-        class BoxObj:
-            def __init__(self, xyxy, cls, conf):
-                self.xyxy = [xyxy]
-                self.cls = [cls]
-                self.conf = [conf]
-                
-        class ResultObj:
-            def __init__(self, boxes_list, names):
-                self.boxes = boxes_list
-                self.names = names
-                
-            def plot(self):
-                annotated = img.copy()
-                for box in self.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    label = f"{self.names[cls_id]} {conf:.2f}"
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                    cv2.putText(annotated, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                return annotated
-                
+
         final_boxes = []
+        annotated = img.copy()
         if len(indices) > 0:
-            for idx in indices.flatten():
+            for idx_item in indices:
+                idx = idx_item[0] if isinstance(idx_item, (list, tuple, np.ndarray)) else idx_item
                 x, y, box_w, box_h = boxes[idx]
-                cls_id = class_ids[idx]
                 conf = confidences[idx]
                 x1 = max(0, x)
                 y1 = max(0, y)
                 x2 = min(w, x + box_w)
                 y2 = min(h, y + box_h)
-                final_boxes.append(BoxObj([x1, y1, x2, y2], cls_id, conf))
-                
-        res_obj = ResultObj(final_boxes, self.names)
-        return [res_obj]
+                final_boxes.append({'box': [x1, y1, x2, y2], 'conf': conf})
+
+                # 繪製醒目標註框
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                label = f"Wound: {top_cls_en} {conf:.2f}"
+                cv2.putText(annotated, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        return {
+            'annotated_image': annotated,
+            'boxes': final_boxes,
+            'top_class_zh': top_cls_zh,
+            'top_class_en': top_cls_en,
+            'top_class_conf': top_cls_conf
+        }
 
 # 建立上傳檔案的資料夾 (如果不存在的話)
 UPLOAD_DIR = "uploads/wounds"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 載入 YOLOv8 傷口特徵辨識模型 (ONNX 格式，省去大容量 PyTorch 的記憶體與載入時間)
-MODEL_PATH = "yolo11m.onnx"
+# 載入雙模型 (Segmenter ROI 定位 + Classifier 傷口分類，ONNX 格式)
+SEG_MODEL_PATH = os.environ.get("SEG_MODEL_PATH", "segmenter.onnx")
+CLS_MODEL_PATH = os.environ.get("CLS_MODEL_PATH", "classifier.onnx")
 try:
-    yolo_model = YOLOONNX(MODEL_PATH)
-    print("[YOLO] ONNX Model loaded successfully!")
+    yolo_model = DualWoundONNX(SEG_MODEL_PATH, CLS_MODEL_PATH)
+    print("[AI] Dual ONNX Models (Segmenter + Classifier) loaded successfully!")
 except Exception as e:
     yolo_model = None
-    print(f"[YOLO] ONNX Model load failed: {str(e)}")
+    print(f"[AI] ONNX Models load failed: {str(e)}")
 
 @app.post("/api/predict")
 async def predict_wound(
@@ -632,10 +616,10 @@ async def predict_wound(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    接收傷口影像，執行 YOLOv8 辨識，並將標註後影像存檔後回傳
+    接收傷口影像，執行雙模型 ONNX 辨識 (Segmenter ROI 定位 + Classifier 傷口分類)，並將標註後影像存檔後回傳
     """
     if yolo_model is None:
-        raise HTTPException(status_code=500, detail="後端 YOLO 模型尚未載入完成或載入失敗。")
+        raise HTTPException(status_code=500, detail="後端 AI 模型尚未載入完成或載入失敗。")
         
     try:
         # 1. 讀取圖片檔案
@@ -645,13 +629,15 @@ async def predict_wound(
         if img is None:
             raise HTTPException(status_code=400, detail="無效的圖片檔案")
             
-        # 2. 進行 YOLOv8 辨識
-        results = yolo_model(img)
-        result = results[0]
-        num_boxes = len(result.boxes)
+        # 2. 進行雙模型 AI 辨識
+        inference_res = yolo_model.predict(img)
+        num_boxes = len(inference_res['boxes'])
+        annotated_img = inference_res['annotated_image']
+        top_cls_zh = inference_res['top_class_zh']
+        top_cls_en = inference_res['top_class_en']
+        top_cls_conf = inference_res['top_class_conf']
         
-        # 3. 繪製標註框並儲存為獨立的標註圖片
-        annotated_img = result.plot()
+        # 3. 儲存標註照片
         unique_id = f"{int(time.time())}_{os.urandom(4).hex()}"
         annotated_filename = f"annotated_{unique_id}.jpg"
         annotated_path = os.path.join(UPLOAD_DIR, annotated_filename)
@@ -659,30 +645,95 @@ async def predict_wound(
         
         annotated_image_url = f"/{UPLOAD_DIR}/{annotated_filename}"
         
-        # 4. 根據偵測結果及分級標準生成 AI 分級建議 (模擬與 backend_export 同等的專業 TIME 指導)
-        if num_boxes > 0:
-            # 依據標註框數量判定分級
-            ai_grade = "Grade 2" if num_boxes == 1 else "Grade 3"
-            ai_confidence = float(result.boxes.conf[0]) if hasattr(result.boxes, 'conf') and len(result.boxes.conf) > 0 else 0.85
-            ai_advice = (
-                f"[AI 臨床診斷] YOLO 成功偵測到 {num_boxes} 個傷口特徵區域！\n"
+        # 4. 根據傷口分類生成專業 T.I.M.E 照護指導建議
+        time_advice_dict = {
+            'Abrasions': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
                 f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 偵測到黃色腐肉與疑似壞死組織，建議進行局部清創。\n"
-                f"I (Infection 感染): 傷口周邊伴隨紅腫泛紅反應，可能存在中度感染風險。\n"
-                f"M (Moisture 滲出液): 評估滲出液量偏多，建議選用高吸收性敷料。\n"
-                f"E (Edge 邊緣): 傷口邊界有浸潤現象，需塗抹皮膚保護劑防止浸漬。"
+                f"T (Tissue 組織): 表皮破損伴隨點狀滲血，請使用無菌生理食鹽水徹底沖洗移除砂石微粒。\n"
+                f"I (Infection 感染): 感染風險低至中度，密切觀察周圍是否出現紅腫熱痛擴散。\n"
+                f"M (Moisture 滲出液): 滲液量初期偏少，建議使用親水性水膠體或薄型人工皮維持濕潤癒合。\n"
+                f"E (Edge 邊緣): 邊緣上皮移行中，換藥時避免暴力撕除敷料拉扯新生組織。"
+            ),
+            'Bruises': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+                f"【T.I.M.E 傷口評估指導】\n"
+                f"T (Tissue 組織): 皮下微血管破裂血腫，表皮完整無開放性創口。\n"
+                f"I (Infection 感染): 表皮未破損感染風險低，注意深層是否有血腫感染引發之搏動性抽痛。\n"
+                f"M (Moisture 滲出液): 無外滲液，受傷 48 小時內宜冰敷收縮血管消腫，48 小時後改採溫熱敷促進吸收。\n"
+                f"E (Edge 邊緣): 觀察皮下瘀血擴散邊界，避免劇烈外力擠壓。"
+            ),
+            'Burns': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+                f"【T.I.M.E 傷口評估指導】\n"
+                f"T (Tissue 組織): 熱力損傷導致表皮或真皮凝固性壞死，請勿自行刺破完整水泡。\n"
+                f"I (Infection 感染): 皮膚屏障嚴重受損，感染風險高，建議配合含銀敷料(Silver)或抗生素藥膏。\n"
+                f"M (Moisture 滲出液): 組織液大量滲出，選用高吸收性泡沫敷料(Foam)預防浸漬。\n"
+                f"E (Edge 邊緣): 創面邊緣脆弱，請使用皮膚保護膜保護健康皮膚。"
+            ),
+            'Cut': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+                f"【T.I.M.E 傷口評估指導】\n"
+                f"T (Tissue 組織): 銳器整齊創緣，注意深層神經、肌腱或血管是否受損，必要時評估縫合。\n"
+                f"I (Infection 感染): 銳器可能帶有破傷風桿菌，請確認破傷風疫苗接種史。\n"
+                f"M (Moisture 滲出液): 少量滲血滲液，初步宜直接加壓止血，清潔後以抗生素紗布覆蓋。\n"
+                f"E (Edge 邊緣): 創緣平整，可使用美容膠帶(Steri-strip)協助對合邊緣加速癒合。"
+            ),
+            'Ingrown_nails': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+                f"【T.I.M.E 傷口評估指導】\n"
+                f"T (Tissue 組織): 趾甲嵌刺甲溝引發肉芽組織增生與腫脹。\n"
+                f"I (Infection 感染): 金黃色葡萄球菌好發感染，局部紅腫熱痛明顯，必要時口服/外用抗生素。\n"
+                f"M (Moisture 滲出液): 常伴隨化膿性分泌物，建議溫水浸泡清潔並維持乾燥通風。\n"
+                f"E (Edge 邊緣): 指甲修剪需平整，切勿深挖兩側甲角以防嵌甲復發。"
+            ),
+            'Laceration': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+                f"【T.I.M.E 傷口評估指導】\n"
+                f"T (Tissue 組織): 鈍力撞擊造成皮膚不規則撕裂，若組織失去活性需適度清創修整。\n"
+                f"I (Infection 感染): 不規則創面易藏污納垢，需加強生理食鹽水沖洗及感染監測。\n"
+                f"M (Moisture 滲出液): 中等滲液量，建議搭配吸收型敷料定時更換。\n"
+                f"E (Edge 邊緣): 傷口邊緣參差不齊，需專業護理評估減張對合。"
+            ),
+            'Stab_wound': (
+                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+                f"【T.I.M.E 傷口評估指導】\n"
+                f"T (Tissue 組織): 表皮開口小但創道深，需慎防深部異物殘留或臟器深層損傷。\n"
+                f"I (Infection 感染): 厭氧菌（破傷風梭菌）極高風險！務必評估施打破傷風類毒素。\n"
+                f"M (Moisture 滲出液): 表面滲出少，內部可能蓄膿或積血，需密切監控深部體溫與腫痛。\n"
+                f"E (Edge 邊緣): 邊緣閉合過早可能導致深部化膿，切忌盲目封閉創口。"
             )
+        }
+
+        ai_advice = time_advice_dict.get(top_cls_en, (
+            f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
+            f"【T.I.M.E 傷口評估指導】\n"
+            f"T (Tissue 組織): 評估創面是否有壞死組織或腐肉。\n"
+            f"I (Infection 感染): 監測局部與周邊發炎指標。\n"
+            f"M (Moisture 滲出液): 依滲出量平衡濕潤度。\n"
+            f"E (Edge 邊緣): 保護周邊皮膚預防浸潤。"
+        ))
+
+        # 5. 評定分級與嚴重度
+        if num_boxes > 0:
+            if top_cls_en in ['Burns', 'Stab_wound', 'Laceration'] or num_boxes >= 2:
+                ai_grade = "Grade 3"
+            else:
+                ai_grade = "Grade 2"
+            ai_confidence = round(max(top_cls_conf, inference_res['boxes'][0]['conf']), 4)
         else:
             ai_grade = "Grade 1"
-            ai_confidence = 0.50
-            ai_advice = "[AI 臨床診斷] 未偵測到明顯的傷口邊界特徵。請確保拍攝光線充足、角度垂直並重新嘗試。"
+            ai_confidence = round(top_cls_conf, 4)
+            ai_advice = f"[AI 臨床診斷：{top_cls_zh} (信心度 {top_cls_conf:.1%})]\n未偵測到明顯深層傷口邊界，研判為輕度或表淺傷口。\n" + ai_advice
 
         return {
             "status": "success",
             "ai_grade": ai_grade,
             "ai_confidence": ai_confidence,
             "ai_advice": ai_advice,
-            "annotated_image_url": annotated_image_url
+            "annotated_image_url": annotated_image_url,
+            "detected_wounds": num_boxes,
+            "wound_class": top_cls_zh
         }
         
     except Exception as e:
