@@ -164,7 +164,7 @@
                                     <p class="text-gray-700 bg-green-50 p-3 rounded-lg text-sm">${record.nurse_advice}</p>
                                 </div>
                                 <div class="mt-2">
-                                    <p class="text-xs text-gray-400 mb-1">🤖 系統 AI 客觀判定輔助參考</p>
+                                    <p class="text-xs text-gray-400 mb-1">🤖 AI 研究提示（已由護理師覆核）</p>
                                     <p class="text-gray-500 text-xs">${record.ai_grade} - ${record.ai_advice}</p>
                                 </div>
                             </div>
@@ -455,6 +455,7 @@
             // 3. 呈現使用者訊息
             appendMessage('user', textVal);
             chatHistory.push({ role: 'user', content: textVal });
+            if (chatHistory.length > 20) chatHistory.splice(0, chatHistory.length - 20);
 
             // 4. 呈現打字效果
             showTypingIndicator();

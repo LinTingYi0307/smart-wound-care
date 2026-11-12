@@ -306,6 +306,7 @@
 
             appendNurseMessage('user', textVal);
             nurseChatHistory.push({ role: 'user', content: textVal });
+            if (nurseChatHistory.length > 20) nurseChatHistory.splice(0, nurseChatHistory.length - 20);
 
             showNurseTypingIndicator();
 

@@ -531,20 +531,19 @@ class DualWoundONNX:
             6: 'Stab_wound'
         }
 
-    def predict(self, img, conf_threshold=0.25, iou_threshold=0.45):
+    def predict(self, img, conf_threshold=0.25, iou_threshold=0.70, crop_margin=0.15, cls_conf_threshold=0.60):
         h, w = img.shape[:2]
 
-        # 1. 傷口類別特徵分類 (Classifier: 224x224)
+        # 1. 傷口類別特徵分類 (Classifier: 224x224, 全圖分類)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         cls_input = cv2.resize(img_rgb, (224, 224)).transpose(2, 0, 1)[None].astype(np.float32) / 255.0
         cls_out = self.cls_session.run(None, {'images': cls_input})[0][0]
         probs = np.exp(cls_out - np.max(cls_out)) / np.sum(np.exp(cls_out - np.max(cls_out)))
         top1_idx = int(np.argmax(probs))
-        top_cls_zh = self.cls_names_zh.get(top1_idx, '未知傷口')
         top_cls_en = self.cls_names_en.get(top1_idx, 'Unknown')
         top_cls_conf = float(probs[top1_idx])
 
-        # 2. 傷口 ROI 邊界分割與框選 (Segmenter: 384x384)
+        # 2. 傷口 ROI 邊界定位分割 (Segmenter: 384x384)
         input_size = 384
         r = min(input_size / h, input_size / w)
         nw, nh = int(round(w * r)), int(round(h * r))
@@ -570,30 +569,52 @@ class DualWoundONNX:
 
         indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, iou_threshold)
 
-        final_boxes = []
+        # 3. 組員版本 ROI 合併大框與邊距 Padding 邏輯 (15% 留白)
         annotated = img.copy()
+        crop_box = None
+        segment_confidence = 0.0
+        valid_boxes = []
+
         if len(indices) > 0:
             for idx_item in indices:
                 idx = idx_item[0] if isinstance(idx_item, (list, tuple, np.ndarray)) else idx_item
                 x, y, box_w, box_h = boxes[idx]
-                conf = confidences[idx]
-                x1 = max(0, x)
-                y1 = max(0, y)
-                x2 = min(w, x + box_w)
-                y2 = min(h, y + box_h)
-                final_boxes.append({'box': [x1, y1, x2, y2], 'conf': conf})
+                valid_boxes.append((x, y, x + box_w, y + box_h))
+                segment_confidence = max(segment_confidence, confidences[idx])
 
-                # 繪製醒目標註框
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                label = f"Wound: {top_cls_en} {conf:.2f}"
-                cv2.putText(annotated, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        if valid_boxes:
+            min_x = max(0, min(b[0] for b in valid_boxes))
+            min_y = max(0, min(b[1] for b in valid_boxes))
+            max_x = min(w, max(b[2] for b in valid_boxes))
+            max_y = min(h, max(b[3] for b in valid_boxes))
+
+            box_w = max(1, max_x - min_x)
+            box_h = max(1, max_y - min_y)
+            dx = int(round(box_w * crop_margin))
+            dy = int(round(box_h * crop_margin))
+
+            crop_box = [max(0, min_x - dx), max(0, min_y - dy), min(w, max_x + dx), min(h, max_y + dy)]
+            x1, y1, x2, y2 = crop_box
+
+            # 採用組員版本墨綠色 (24, 160, 147) 標註框
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (24, 160, 147), 3)
+            label_text = f"{top_cls_en} {top_cls_conf:.0%}"
+            cv2.putText(annotated, label_text, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (24, 160, 147), 2)
+
+        # 4. 信心度門檻檢查 (低於 60% 判定為 low_confidence)
+        low_confidence = (top_cls_conf < cls_conf_threshold)
+        reliable = (crop_box is not None and not low_confidence)
+        active_label = top_cls_en if reliable else None
 
         return {
             'annotated_image': annotated,
-            'boxes': final_boxes,
-            'top_class_zh': top_cls_zh,
+            'crop_box': crop_box,
+            'segment_confidence': segment_confidence if crop_box else None,
+            'class_confidence': top_cls_conf,
+            'label': active_label,
             'top_class_en': top_cls_en,
-            'top_class_conf': top_cls_conf
+            'low_confidence': low_confidence,
+            'reliable': reliable
         }
 
 # 建立上傳檔案的資料夾 (如果不存在的話)
@@ -616,7 +637,7 @@ async def predict_wound(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    接收傷口影像，執行雙模型 ONNX 辨識 (Segmenter ROI 定位 + Classifier 傷口分類)，並將標註後影像存檔後回傳
+    接收傷口影像，執行雙模型 ONNX 辨識 (Segmenter ROI 定位 + Classifier 傷口分類)，並依組員規範格式回傳
     """
     if yolo_model is None:
         raise HTTPException(status_code=500, detail="後端 AI 模型尚未載入完成或載入失敗。")
@@ -629,13 +650,14 @@ async def predict_wound(
         if img is None:
             raise HTTPException(status_code=400, detail="無效的圖片檔案")
             
-        # 2. 進行雙模型 AI 辨識
+        # 2. 進行雙模型 AI 辨識 (採用組員 Cascade 門檻與 ROI 留白邏輯)
         inference_res = yolo_model.predict(img)
-        num_boxes = len(inference_res['boxes'])
         annotated_img = inference_res['annotated_image']
-        top_cls_zh = inference_res['top_class_zh']
+        crop_box = inference_res['crop_box']
+        class_conf = inference_res['class_confidence']
+        label = inference_res['label']
         top_cls_en = inference_res['top_class_en']
-        top_cls_conf = inference_res['top_class_conf']
+        low_confidence = inference_res['low_confidence']
         
         # 3. 儲存標註照片
         unique_id = f"{int(time.time())}_{os.urandom(4).hex()}"
@@ -645,86 +667,11 @@ async def predict_wound(
         
         annotated_image_url = f"/{UPLOAD_DIR}/{annotated_filename}"
         
-        # 4. 根據傷口分類生成專業 T.I.M.E 照護指導建議
-        time_advice_dict = {
-            'Abrasions': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 表皮破損伴隨點狀滲血，請使用無菌生理食鹽水徹底沖洗移除砂石微粒。\n"
-                f"I (Infection 感染): 感染風險低至中度，密切觀察周圍是否出現紅腫熱痛擴散。\n"
-                f"M (Moisture 滲出液): 滲液量初期偏少，建議使用親水性水膠體或薄型人工皮維持濕潤癒合。\n"
-                f"E (Edge 邊緣): 邊緣上皮移行中，換藥時避免暴力撕除敷料拉扯新生組織。"
-            ),
-            'Bruises': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 皮下微血管破裂血腫，表皮完整無開放性創口。\n"
-                f"I (Infection 感染): 表皮未破損感染風險低，注意深層是否有血腫感染引發之搏動性抽痛。\n"
-                f"M (Moisture 滲出液): 無外滲液，受傷 48 小時內宜冰敷收縮血管消腫，48 小時後改採溫熱敷促進吸收。\n"
-                f"E (Edge 邊緣): 觀察皮下瘀血擴散邊界，避免劇烈外力擠壓。"
-            ),
-            'Burns': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 熱力損傷導致表皮或真皮凝固性壞死，請勿自行刺破完整水泡。\n"
-                f"I (Infection 感染): 皮膚屏障嚴重受損，感染風險高，建議配合含銀敷料(Silver)或抗生素藥膏。\n"
-                f"M (Moisture 滲出液): 組織液大量滲出，選用高吸收性泡沫敷料(Foam)預防浸漬。\n"
-                f"E (Edge 邊緣): 創面邊緣脆弱，請使用皮膚保護膜保護健康皮膚。"
-            ),
-            'Cut': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 銳器整齊創緣，注意深層神經、肌腱或血管是否受損，必要時評估縫合。\n"
-                f"I (Infection 感染): 銳器可能帶有破傷風桿菌，請確認破傷風疫苗接種史。\n"
-                f"M (Moisture 滲出液): 少量滲血滲液，初步宜直接加壓止血，清潔後以抗生素紗布覆蓋。\n"
-                f"E (Edge 邊緣): 創緣平整，可使用美容膠帶(Steri-strip)協助對合邊緣加速癒合。"
-            ),
-            'Ingrown_nails': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 趾甲嵌刺甲溝引發肉芽組織增生與腫脹。\n"
-                f"I (Infection 感染): 金黃色葡萄球菌好發感染，局部紅腫熱痛明顯，必要時口服/外用抗生素。\n"
-                f"M (Moisture 滲出液): 常伴隨化膿性分泌物，建議溫水浸泡清潔並維持乾燥通風。\n"
-                f"E (Edge 邊緣): 指甲修剪需平整，切勿深挖兩側甲角以防嵌甲復發。"
-            ),
-            'Laceration': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 鈍力撞擊造成皮膚不規則撕裂，若組織失去活性需適度清創修整。\n"
-                f"I (Infection 感染): 不規則創面易藏污納垢，需加強生理食鹽水沖洗及感染監測。\n"
-                f"M (Moisture 滲出液): 中等滲液量，建議搭配吸收型敷料定時更換。\n"
-                f"E (Edge 邊緣): 傷口邊緣參差不齊，需專業護理評估減張對合。"
-            ),
-            'Stab_wound': (
-                f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-                f"【T.I.M.E 傷口評估指導】\n"
-                f"T (Tissue 組織): 表皮開口小但創道深，需慎防深部異物殘留或臟器深層損傷。\n"
-                f"I (Infection 感染): 厭氧菌（破傷風梭菌）極高風險！務必評估施打破傷風類毒素。\n"
-                f"M (Moisture 滲出液): 表面滲出少，內部可能蓄膿或積血，需密切監控深部體溫與腫痛。\n"
-                f"E (Edge 邊緣): 邊緣閉合過早可能導致深部化膿，切忌盲目封閉創口。"
-            )
-        }
-
-        ai_advice = time_advice_dict.get(top_cls_en, (
-            f"[AI 臨床診斷：{top_cls_zh} - 信心度 {top_cls_conf:.1%}]\n"
-            f"【T.I.M.E 傷口評估指導】\n"
-            f"T (Tissue 組織): 評估創面是否有壞死組織或腐肉。\n"
-            f"I (Infection 感染): 監測局部與周邊發炎指標。\n"
-            f"M (Moisture 滲出液): 依滲出量平衡濕潤度。\n"
-            f"E (Edge 邊緣): 保護周邊皮膚預防浸潤。"
-        ))
-
-        # 5. 評定分級與嚴重度
-        if num_boxes > 0:
-            if top_cls_en in ['Burns', 'Stab_wound', 'Laceration'] or num_boxes >= 2:
-                ai_grade = "Grade 3"
-            else:
-                ai_grade = "Grade 2"
-            ai_confidence = round(max(top_cls_conf, inference_res['boxes'][0]['conf']), 4)
-        else:
-            ai_grade = "Grade 1"
-            ai_confidence = round(top_cls_conf, 4)
-            ai_advice = f"[AI 臨床診斷：{top_cls_zh} (信心度 {top_cls_conf:.1%})]\n未偵測到明顯深層傷口邊界，研判為輕度或表淺傷口。\n" + ai_advice
+        # 4. 依照組員規範產生研究提示與覆核規範文字
+        REVIEW_TEXT = "研究模型結果須由護理師覆核，不能用來判定臨床 Grade、感染或處置。"
+        ai_grade = "待人工判讀"
+        ai_confidence = round(float(class_conf), 4) if label else 0.0
+        ai_advice = (f"研究分類提示：{label}。" if label else "無可靠定位或分類結果。") + REVIEW_TEXT
 
         return {
             "status": "success",
@@ -732,9 +679,14 @@ async def predict_wound(
             "ai_confidence": ai_confidence,
             "ai_advice": ai_advice,
             "annotated_image_url": annotated_image_url,
-            "detected_wounds": num_boxes,
-            "wound_class": top_cls_zh
+            "requires_human_review": True,
+            "research_class": label,
+            "detected_wounds": 1 if crop_box else 0,
+            "wound_class": label or "無可靠分類"
         }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI 辨識發生錯誤: {str(e)}")
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI 辨識發生錯誤: {str(e)}")

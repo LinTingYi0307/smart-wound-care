@@ -38,6 +38,10 @@ backend_export/
 backend_export.zip
 db_info.txt
 push_to_github.bat
+start_share_ngrok.bat
+start_share_免註冊分享.bat
+ngrok.exe
+cloudflared.exe
 scratch/
 healthcare.db
 smart-wound-care-docker/
